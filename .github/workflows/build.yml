@@ -256,7 +256,7 @@ jobs:
           path: linux_FLAC-Chop_*_${{ matrix.artifact_suffix }}.AppImage
           if-no-files-found: error
 
-  # --- Windows EXE (x86_64 via MSYS2 MINGW64) ---
+  # --- Windows EXE (x86_64 via MSYS2 CLANG64) ---
   windows-exe:
     name: Windows EXE (x86_64)
     runs-on: windows-2022
@@ -267,27 +267,34 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup MSYS2
+      - name: Setup MSYS2 (CLANG64)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          # MINGW64 is deprecated upstream (2026-03-15 news) and its packages
+          # are being removed: mingw-w64-x86_64-sox vanished from the repo DB
+          # between the green 2026-10-11 run and 2026-10-17 ("target not
+          # found"), breaking this job at the Setup MSYS2 step. CLANG64 keeps
+          # the full package set (sox, glslang, OpenCL, Vulkan — verified in
+          # the live clang64.db) and is the same environment family as the
+          # arm64 job's CI-green CLANGARM64.
+          msystem: CLANG64
           update: true
           install: >-
             git
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt6-base
-            mingw-w64-x86_64-qt6-tools
-            mingw-w64-x86_64-sox
-            mingw-w64-x86_64-flac
-            mingw-w64-x86_64-libogg
-            mingw-w64-x86_64-glslang
-            mingw-w64-x86_64-opencl-headers
-            mingw-w64-x86_64-opencl-icd
-            mingw-w64-x86_64-vulkan-headers
-            mingw-w64-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-qt6-base
+            mingw-w64-clang-x86_64-qt6-tools
+            mingw-w64-clang-x86_64-sox
+            mingw-w64-clang-x86_64-flac
+            mingw-w64-clang-x86_64-libogg
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-opencl-headers
+            mingw-w64-clang-x86_64-opencl-icd
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
 
       - name: Resolve build version
         id: version
@@ -306,12 +313,18 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust (MinGW gnu toolchain)
+      - name: Install Rust (x86_64 gnullvm toolchain)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # MinGW gnu toolchain matches MSYS2 MINGW64's gcc and the shared
-          # Qt6/sox MSYS2 packages (which are built with the same gcc).
-          toolchain: stable-x86_64-pc-windows-gnu
+          # x86_64-pc-windows-gnullvm = the LLVM-mingw x86_64 ABI, which
+          # matches MSYS2's CLANG64 Qt6/sox (built against the LLVM-mingw
+          # runtime) — the same pairing as the arm64 job's CLANGARM64 +
+          # aarch64-pc-windows-gnullvm, which is already CI-green. Installing
+          # it as the job's default toolchain means `cargo build --release`
+          # (no --target) builds for gnullvm and lands the staticlib at
+          # core/target/release/libflac_chop_core.a, matching
+          # gui/CMakeLists.txt (which uses .a for every non-MSVC toolchain).
+          toolchain: stable-x86_64-pc-windows-gnullvm
 
       - name: Build FLAC-Chop
         shell: msys2 {0}
@@ -319,7 +332,7 @@ jobs:
           set -euo pipefail
           export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
           cargo --version
-          # Shared Qt6 + shared sox from MSYS2 MINGW64 (no static deps). The
+          # Shared Qt6 + shared sox from MSYS2 CLANG64 (no static deps). The
           # runtime DLLs are bundled into the portable ZIP / installer below,
           # mirroring the arm64 job — this sidesteps the static-Qt problems.
           # Pass the resolved release version explicitly so the in-app
@@ -362,7 +375,7 @@ jobs:
           cp "$BUILD_DIR/gui/flac-chop.exe" dist/
           windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
           # Bundle SoX so users do not need a separate SoX install on PATH.
-          cp "/mingw64/bin/sox.exe" dist/
+          cp "/clang64/bin/sox.exe" dist/
           test -x dist/sox.exe
           # The copy-in ld-compress-ng CLI (built beside flac-chop by the
           # same cmake build) — its MinGW DLL deps are bundled by the ldd
@@ -374,10 +387,11 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          # MINGW64 Qt6 DLLs depend on the gcc runtime + third-party libs that
-          # windeployqt does not copy; iterate ldd to a fixpoint and copy every
-          # /mingw64/bin DLL into dist. Same approach as the arm64 job.
-          BINDIR="/mingw64/bin"
+          # CLANG64 Qt6 DLLs depend on the LLVM-mingw compiler runtime +
+          # third-party libs that windeployqt does not copy; iterate ldd to a
+          # fixpoint and copy every /clang64/bin DLL into dist. Same approach
+          # as the arm64 job.
+          BINDIR="/clang64/bin"
           for pass in 1 2 3 4 5 6 7 8; do
             new=0
             while IFS= read -r d; do

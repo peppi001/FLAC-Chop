@@ -38,23 +38,26 @@ jobs:
           key: cargo-test-${{ matrix.os }}-${{ hashFiles('core/Cargo.lock') }}
 
       - name: Setup MSYS2 + SoX (Windows)
-        # MSYS2's MinGW64 SoX — the exact build the Windows artifacts bundle.
+        # MSYS2's CLANG64 SoX — the exact build the Windows artifacts bundle
+        # (build.yml's x86_64 job moved MINGW64 -> CLANG64 on 2026-10-17:
+        # MINGW64 is deprecated upstream and mingw-w64-x86_64-sox was dropped
+        # from the repo DB, failing CI with "target not found").
         # choco's sox.portable shim proved unfit for the pipeline (the
         # stdin-fed .lds cuts failed with no usable sox error text).
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: CLANG64
           update: false
-          install: mingw-w64-x86_64-sox
+          install: mingw-w64-clang-x86_64-sox
 
       - name: Export the MSYS2 SoX path (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          /mingw64/bin/sox --version
-          echo "FLAC_CHOP_SOX=$(cygpath -w /mingw64/bin/sox.exe)" >> "$GITHUB_ENV"
+          /clang64/bin/sox --version
+          echo "FLAC_CHOP_SOX=$(cygpath -w /clang64/bin/sox.exe)" >> "$GITHUB_ENV"
 
       - name: Install SoX (Linux/macOS; the real-pipeline tests skip without it)
         shell: bash
