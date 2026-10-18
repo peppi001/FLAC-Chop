@@ -25,14 +25,13 @@ Every packaged build reports its release version (window title, `flac-chop --ver
 ## Screenshots
 
 
-<img width="400" height="" alt="main" src="https://github.com/user-attachments/assets/51fc15a5-0abd-443e-bc01-74523b483611" />
+<img width="" height="400" alt="image" src="https://github.com/user-attachments/assets/f036767d-4506-423f-b5e0-a333967a7efe" /><img width="" height="400" alt="image" src="https://github.com/user-attachments/assets/fa90a51a-7d8a-4963-bdbc-c1c366731332" />
 
-<img width="400" height="" alt="metadata" src="https://github.com/user-attachments/assets/a563cf15-51d3-42b1-a22f-c2d90a79b4c9" />
-
-<img width="400" height="400" alt="batch" src="https://github.com/user-attachments/assets/a7852d71-69d1-48b9-8ab8-e3b9997f62fa" />
+<img width="" height="400" alt="image" src="https://github.com/user-attachments/assets/85d79d86-34fc-48c0-83ac-5782958c6992" /><img width="" height="400" alt="image" src="https://github.com/user-attachments/assets/ad3d1f94-29b9-4555-8932-11ca5c9b9ae1" />
 
 
 ## Building 
+
 
 Packaged [release](https://github.com/harrypm/FLAC-Chop/releases) artifacts are self-contained: they bundle SoX and required
 runtime libraries. 
