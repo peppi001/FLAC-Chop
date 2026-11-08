@@ -16,9 +16,26 @@ set -eux
 
 FLAC_VERSION="${1:-1.5.0}"
 
-curl -fsSL \
-  "https://github.com/xiph/flac/releases/download/${FLAC_VERSION}/flac-${FLAC_VERSION}.tar.xz" \
+# Prefer Xiph's canonical source archive endpoint: the GitHub release
+# asset URL has returned HTTP 404 on GitHub Actions Linux runners.
+curl -fL --retry 3 --retry-delay 2 --retry-all-errors \
+  "https://downloads.xiph.org/releases/flac/flac-${FLAC_VERSION}.tar.xz" \
   -o /tmp/flac.tar.xz
+
+# Pin the published 1.5.0 SHA-256, so CI never compiles a wrong or partial
+# archive. Other versions still require an explicitly maintained checksum.
+case "${FLAC_VERSION}" in
+  1.5.0)
+    printf '%s  %s\n' \
+      'f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920' \
+      /tmp/flac.tar.xz | sha256sum --check --status
+    ;;
+  *)
+    echo "Unsupported FLAC version without a pinned checksum: ${FLAC_VERSION}" >&2
+    exit 1
+    ;;
+esac
+
 rm -rf "/tmp/flac-${FLAC_VERSION}" /tmp/flac-build
 tar -xf /tmp/flac.tar.xz -C /tmp
 
