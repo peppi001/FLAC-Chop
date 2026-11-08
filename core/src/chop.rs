@@ -1598,6 +1598,22 @@ fn in_hints_for(
     Ok(hints)
 }
 
+// MISRC RF captures can declare a STREAMINFO sample count scaled by 1000,
+// even while their RF metadata contains the true count. This must not limit
+// SoX's input effect when a trusted RF length proves the header too short.
+#[cfg(feature = "static-sox")]
+fn rf_flac_declared_length_is_unreliable(info: &probe::ProbeResult) -> bool {
+    info.ok
+        && info.format == InputFormat::Flac
+        && info.is_rf
+        && info.total_samples_known
+        && info.declared_total_samples != 0
+        && info.total_samples > info.declared_total_samples
+        && (info.total_samples_from_vorbis
+            || info.total_samples_from_companion
+            || (info.total_samples_wraps > 0 && !info.total_samples_estimated))
+}
+
 #[cfg(feature = "static-sox")]
 /// Run one in-process libSoX effects chain: input → trim → [sinc] →
 /// [rate, if output rate differs] → [vol] → output. No dither is ever added.
@@ -1638,6 +1654,17 @@ unsafe fn run_chain(
         );
         if in_fmt.is_null() {
             return Err("sox_open_read failed".into());
+        }
+
+        // libSoX's input effect otherwise stops at the scaled STREAMINFO
+        // sample count. Leave the source FLAC untouched: a zero length means
+        // unknown and permits decoding until the real end of the stream.
+        // Only ignore a declared length when independent RF data proves it
+        // is too short; normal audio and correctly declared FLACs are unchanged.
+        if in_hints.is_none()
+            && rf_flac_declared_length_is_unreliable(&probe::probe(Path::new(in_path)))
+        {
+            (*in_fmt).signal.length = 0;
         }
 
         // Build the output signal/encoding from the input, applying the
@@ -1739,7 +1766,9 @@ unsafe fn run_chain(
             Some(e) => (false, e.clone()),
             None => {
                 let rc = sox_ffi::sox_flow_effects(chain, None, std::ptr::null_mut());
-                if rc == sox_ffi::SOX_SUCCESS {
+                // An intentional bounded trim may finish the chain at EOF.
+                // The post-cut check still rejects empty or short outputs.
+                if rc == sox_ffi::SOX_SUCCESS || rc == sox_ffi::SOX_EOF {
                     (true, String::new())
                 } else {
                     (false, format!("sox_flow_effects failed: {rc}"))
@@ -1895,6 +1924,13 @@ fn chop_native_input(
             r.stderr = msg;
         }
     }
+    if r.ok && opts.output_rate_hz.is_none() {
+        if let Err(msg) = validate_plain_trim_sample_count(out_path, length_samples) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = msg;
+        }
+    }
     if !si_note.is_empty() {
         r.stderr = if r.stderr.is_empty() {
             si_note
@@ -1909,6 +1945,26 @@ fn chop_native_input(
         rewrite_tags_after_cut(out_path, opts.is_rf, extra_comments, &mut r);
     }
     r
+}
+
+#[cfg(feature = "static-sox")]
+fn validate_plain_trim_sample_count(out_path: &str, expected: u64) -> Result<(), String> {
+    // Read the STREAMINFO field rather than the probe's reconstructed total:
+    // SoX may have copied stale source RF tags before the tag rewrite runs.
+    if expected >= (1u64 << 36) {
+        return Ok(());
+    }
+    let info = probe::probe(Path::new(out_path));
+    if !info.ok {
+        return Err(format!("could not inspect cut output sample count: {}", info.error));
+    }
+    if info.declared_total_samples != expected {
+        return Err(format!(
+            "cut sample count mismatch: expected {expected}, wrote {}",
+            info.declared_total_samples
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "static-sox")]
@@ -2716,6 +2772,115 @@ pub fn generate_output_path(in_path: &str, out_dir: &str, stem_override: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "static-sox")]
+    #[test]
+    fn scaled_rf_flac_header_does_not_truncate_later_window() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = std::env::temp_dir()
+            .join(format!("fc_rf_scaled_header_{}", temp_tag()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("input.s16");
+        let src = dir.join("source.flac");
+        let cut = dir.join("cut.flac");
+        let samples: Vec<i16> = (0..400_000)
+            .map(|i| ((i % 10_007) as i16) - 5_003)
+            .collect();
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        std::fs::write(&raw, bytes).unwrap();
+
+        // Generate a real 16-bit RF FLAC with correct RF tags.
+        let initial = chop_with_options(
+            raw.to_str().unwrap(),
+            src.to_str().unwrap(),
+            0,
+            samples.len() as u64,
+            ChopOptions {
+                is_rf: true,
+                input_format: Some(InputFormat::S16),
+                input_rate_hz: Some(40_000_000.0),
+                ..Default::default()
+            },
+        );
+        assert!(initial.ok, "{}", initial.stderr);
+        assert!(probe::probe(&src).total_samples_from_vorbis);
+
+        // Reproduce the MISRC header: declared count / 1000 while the
+        // Vorbis tag still carries the real sample count.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&src)
+            .unwrap();
+        f.seek(SeekFrom::Start(18)).unwrap();
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).unwrap();
+        let packed = u64::from_be_bytes(buf);
+        let mask = (1u64 << 36) - 1;
+        let new_packed = (packed & !mask) | (samples.len() as u64 / 1000);
+        f.seek(SeekFrom::Start(18)).unwrap();
+        f.write_all(&new_packed.to_be_bytes()).unwrap();
+        drop(f);
+        let input_info = probe::probe(&src);
+        assert!(rf_flac_declared_length_is_unreliable(&input_info));
+        assert_eq!(input_info.total_samples, samples.len() as u64);
+
+        // The window begins well after the misleading STREAMINFO end.
+        let start = 120_000u64;
+        let len = 18_000u64;
+        let result = chop_with_options(
+            src.to_str().unwrap(),
+            cut.to_str().unwrap(),
+            start,
+            len,
+            ChopOptions { is_rf: true, ..Default::default() },
+        );
+        assert!(result.ok, "{}", result.stderr);
+        let mut decoder = claxon::FlacReader::open(&cut).unwrap();
+        let output: Vec<i16> = decoder.samples().map(|s| s.unwrap() as i16).collect();
+        assert_eq!(output, samples[start as usize..(start + len) as usize]);
+        let output_info = probe::probe(&cut);
+        assert_eq!(output_info.total_samples, len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rf_flac_invalid_header_length_requires_trusted_rf_total() {
+        let mut info = probe::ProbeResult {
+            ok: true,
+            format: InputFormat::Flac,
+            is_rf: true,
+            total_samples_known: true,
+            declared_total_samples: 97_395_933,
+            total_samples: 97_395_933_184,
+            total_samples_from_vorbis: true,
+            ..Default::default()
+        };
+        assert!(rf_flac_declared_length_is_unreliable(&info));
+
+        info.is_rf = false;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.is_rf = true;
+        info.format = InputFormat::Wav;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.format = InputFormat::Flac;
+        info.total_samples_from_vorbis = false;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_from_companion = true;
+        assert!(rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_from_companion = false;
+        info.total_samples_wraps = 1;
+        assert!(rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_estimated = true;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_from_vorbis = true;
+        info.declared_total_samples = info.total_samples;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+    }
 
     #[test]
     fn parse_ldc_progress_extracts_last_percentage() {
