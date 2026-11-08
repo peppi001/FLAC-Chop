@@ -1343,6 +1343,15 @@ fn chop_native_input_ex(
             r.stderr = msg;
         }
     }
+    if r.ok && scaled_rf_flac && opts.output_rate_hz.is_none() {
+        // A truncated or prematurely closed decoder can otherwise produce a
+        // nonempty but incomplete cut with a successful SoX exit status.
+        if let Err(msg) = validate_plain_trim_sample_count(out_path, length_samples) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = msg;
+        }
+    }
     if !si_note.is_empty() {
         r.stderr = if r.stderr.is_empty() {
             si_note
@@ -2025,7 +2034,6 @@ fn chop_native_input(
     r
 }
 
-#[cfg(feature = "static-sox")]
 fn validate_plain_trim_sample_count(out_path: &str, expected: u64) -> Result<(), String> {
     // Read the STREAMINFO field rather than the probe's reconstructed total:
     // SoX may have copied stale source RF tags before the tag rewrite runs.
