@@ -701,13 +701,38 @@ fn run_sox_child(
 /// the source or materializing the huge decoded capture on disk.
 fn make_scaled_rf_flac_s16_feed(
     in_path: &str,
-    required_interleaved_samples: u64,
-) -> Result<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>, String> {
+    start_samples: u64,
+    length_samples: u64,
+    channels: u32,
+) -> Result<
+    (
+        Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>,
+        u64,
+    ),
+    String,
+> {
+    let window = crate::fastseek::locate(Path::new(in_path), start_samples)?;
+    let first_sample = window.first_sample;
+    let relative_start = start_samples
+        .checked_sub(first_sample)
+        .ok_or("RF FLAC frame locator returned a position after the cut start")?;
+    let required_interleaved_samples = relative_start
+        .checked_add(length_samples)
+        .and_then(|n| n.checked_mul(u64::from(channels)))
+        .ok_or("RF FLAC cut window sample count overflow")?;
     let path = in_path.to_owned();
-    Ok(Box::new(move |stdin: &mut std::process::ChildStdin| {
-        use std::io::Write;
-        let mut decoder = claxon::FlacReader::open(&path)
-            .map_err(|e| format!("RF FLAC decode open failed: {e}"))?;
+    let feed = Box::new(move |stdin: &mut std::process::ChildStdin| {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut input_file = std::fs::File::open(&path)
+            .map_err(|e| format!("RF FLAC source open failed: {e}"))?;
+        input_file.seek(SeekFrom::Start(window.frame_offset))
+            .map_err(|e| format!("RF FLAC frame seek failed: {e}"))?;
+        // Claxon reads metadata from the virtual header followed immediately
+        // by the complete FLAC frame located by the binary search. The rest
+        // of the source before that frame is never read from the SMB drive.
+        let source = std::io::Cursor::new(window.header).chain(input_file);
+        let mut decoder = claxon::FlacReader::new(source)
+            .map_err(|e| format!("RF FLAC window decoder open failed: {e}"))?;
         if decoder.streaminfo().bits_per_sample != 16 {
             return Err("RF FLAC stdin feeder requires a 16-bit source".into());
         }
@@ -744,7 +769,8 @@ fn make_scaled_rf_flac_s16_feed(
             }
         }
         Ok(())
-    }))
+    });
+    Ok((feed, first_sample))
 }
 
 #[cfg(not(feature = "static-sox"))]
@@ -967,7 +993,7 @@ fn chop_native_input_ex(
     // tag rewrite (the GUI's pre-conversion metadata rows).
     extra_comments: &[String],
 ) -> ChopResult {
-    let start = format!("{}s", start_samples);
+    let mut sox_start_samples = start_samples;
     let len = format!("{}s", length_samples);
     let sox_program = shelldet::resolve().unwrap_or_else(|| PathBuf::from("sox"));
     // 6-bit is emulated on a 6-bit grid in an 8-bit FLAC container via a
@@ -1164,22 +1190,24 @@ fn chop_native_input_ex(
         Some((args, feed)) => (args, "-".to_string(), Some(feed)),
         None if scaled_rf_flac && probe::probe(Path::new(in_path)).bits_per_sample == 16 => {
             let p = probe::probe(Path::new(in_path));
-            let interleaved = start_samples
-                .saturating_add(length_samples)
-                .saturating_mul(u64::from(p.channels));
-            match make_scaled_rf_flac_s16_feed(in_path, interleaved) {
-                Ok(feed) => (
-                    vec![
-                        "-t".to_string(),
-                        "s16".to_string(),
-                        "-r".to_string(),
-                        p.header_sample_rate.to_string(),
-                        "-c".to_string(),
-                        p.channels.to_string(),
-                    ],
-                    "-".to_string(),
-                    Some(feed),
-                ),
+            match make_scaled_rf_flac_s16_feed(
+                in_path, start_samples, length_samples, p.channels,
+            ) {
+                Ok((feed, first_sample)) => {
+                    sox_start_samples = start_samples - first_sample;
+                    (
+                        vec![
+                            "-t".to_string(),
+                            "s16".to_string(),
+                            "-r".to_string(),
+                            p.header_sample_rate.to_string(),
+                            "-c".to_string(),
+                            p.channels.to_string(),
+                        ],
+                        "-".to_string(),
+                        Some(feed),
+                    )
+                }
                 Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
             }
         }
@@ -1261,7 +1289,7 @@ fn chop_native_input_ex(
         PathBuf::from(out_path)
     };
     cmd.arg(&out_target);
-    cmd.arg("trim").arg(&start).arg(&len);
+    cmd.arg("trim").arg(format!("{}s", sox_start_samples)).arg(&len);
 
     if let Some(rate) = opts.output_rate_hz {
         if rate > 0 && opts.basic_rf_filter {
@@ -2869,8 +2897,16 @@ mod tests {
         let raw = dir.join("input.s16");
         let src = dir.join("source.flac");
         let cut = dir.join("cut.flac");
-        let samples: Vec<i16> = (0..400_000)
-            .map(|i| ((i % 10_007) as i16) - 5_003)
+        // Multiple megabytes of incompressible samples force the fast locator
+        // to search the interior rather than always choosing the first frame.
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let samples: Vec<i16> = (0..1_600_000)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng as i16
+            })
             .collect();
         let bytes: Vec<u8> = samples
             .iter()
@@ -2934,8 +2970,11 @@ mod tests {
         assert_eq!(input_info.total_samples, huge_total);
 
         // The window begins well after the misleading STREAMINFO end.
-        let start = 120_000u64;
+        let start = 1_200_000u64;
         let len = 18_000u64;
+        let frame = crate::fastseek::locate(&src, start).unwrap();
+        assert!(frame.first_sample > 0, "random-access seek returned the first frame");
+        assert!(frame.first_sample <= start);
         let result = chop_with_options(
             src.to_str().unwrap(),
             cut.to_str().unwrap(),
