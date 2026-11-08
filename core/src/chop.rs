@@ -730,7 +730,7 @@ fn make_scaled_rf_flac_s16_feed(
         // Claxon reads metadata from the virtual header followed immediately
         // by the complete FLAC frame located by the binary search. The rest
         // of the source before that frame is never read from the SMB drive.
-        let source = std::io::Cursor::new(window.header).chain(input_file);
+        let source = std::io::Cursor::new(window.header.clone()).chain(input_file);
         let mut decoder = claxon::FlacReader::new(source)
             .map_err(|e| format!("RF FLAC window decoder open failed: {e}"))?;
         if decoder.streaminfo().bits_per_sample != 16 {
