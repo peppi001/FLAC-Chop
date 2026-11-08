@@ -361,7 +361,7 @@ jobs:
             throw "version mismatch: built exe must contain the version literal '$expected'"
           }
           # Also verify the OLD bug string is absent (never ship dev-)
-          if ($text -match 'dev-[0-9a-f]{7,}' -and '$expected' -notmatch '^dev-') {
+          if ($text -match 'dev-[0-9a-f]{7,}' -and $expected -notmatch '^dev-') {
             $found = [regex]::Match($text, 'dev-[0-9a-f]{7,}').Value
             throw "CRITICAL: release exe contains '$found' — the dev- fallback leaked into a release build"
           }
@@ -653,7 +653,7 @@ jobs:
           if ($text -notmatch [regex]::Escape($expected)) {
             throw "version mismatch: built exe must contain the version literal '$expected'"
           }
-          if ($text -match 'dev-[0-9a-f]{7,}' -and '$expected' -notmatch '^dev-') {
+          if ($text -match 'dev-[0-9a-f]{7,}' -and $expected -notmatch '^dev-') {
             $found = [regex]::Match($text, 'dev-[0-9a-f]{7,}').Value
             throw "CRITICAL: release exe contains '$found' — the dev- fallback leaked into a release build"
           }
