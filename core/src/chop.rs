@@ -694,6 +694,86 @@ fn run_sox_child(
     Ok((status, stderr))
 }
 #[cfg(not(feature = "static-sox"))]
+/// Stream a 16-bit RF FLAC whose STREAMINFO length is known to be truncated.
+/// SoX/libFLAC refuses to read past the declared number of samples, even with
+/// --ignore-length. Claxon decodes FLAC frames to real signed s16 PCM and the
+/// existing SoX stdin path performs the sample-exact trim without rewriting
+/// the source or materializing the huge decoded capture on disk.
+fn make_scaled_rf_flac_s16_feed(
+    in_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    channels: u32,
+) -> Result<
+    (
+        Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>,
+        u64,
+    ),
+    String,
+> {
+    let window = crate::fastseek::locate(Path::new(in_path), start_samples)?;
+    let first_sample = window.first_sample;
+    let relative_start = start_samples
+        .checked_sub(first_sample)
+        .ok_or("RF FLAC frame locator returned a position after the cut start")?;
+    let required_interleaved_samples = relative_start
+        .checked_add(length_samples)
+        .and_then(|n| n.checked_mul(u64::from(channels)))
+        .ok_or("RF FLAC cut window sample count overflow")?;
+    let path = in_path.to_owned();
+    let feed = Box::new(move |stdin: &mut std::process::ChildStdin| {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut input_file = std::fs::File::open(&path)
+            .map_err(|e| format!("RF FLAC source open failed: {e}"))?;
+        input_file.seek(SeekFrom::Start(window.frame_offset))
+            .map_err(|e| format!("RF FLAC frame seek failed: {e}"))?;
+        // Claxon reads metadata from the virtual header followed immediately
+        // by the complete FLAC frame located by the binary search. The rest
+        // of the source before that frame is never read from the SMB drive.
+        let source = std::io::Cursor::new(window.header.clone()).chain(input_file);
+        let mut decoder = claxon::FlacReader::new(source)
+            .map_err(|e| format!("RF FLAC window decoder open failed: {e}"))?;
+        if decoder.streaminfo().bits_per_sample != 16 {
+            return Err("RF FLAC stdin feeder requires a 16-bit source".into());
+        }
+        let mut input = decoder.samples();
+        let mut written = 0u64;
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        while written < required_interleaved_samples {
+            bytes.clear();
+            for _ in 0..32_768 {
+                if written >= required_interleaved_samples {
+                    break;
+                }
+                match input.next() {
+                    Some(Ok(value)) => {
+                        if value < i16::MIN as i32 || value > i16::MAX as i32 {
+                            return Err(format!("RF FLAC sample outside 16-bit range: {value}"));
+                        }
+                        bytes.extend_from_slice(&(value as i16).to_le_bytes());
+                        written += 1;
+                    }
+                    Some(Err(e)) => return Err(format!("RF FLAC decoding failed: {e}")),
+                    None => break,
+                }
+            }
+            if bytes.is_empty() {
+                break;
+            }
+            match stdin.write_all(&bytes) {
+                Ok(()) => {}
+                // Once the requested trim has finished, SoX closes stdin.
+                // This is expected and the output is checked after the cut.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(e) => return Err(format!("RF FLAC stdin write failed: {e}")),
+            }
+        }
+        Ok(())
+    });
+    Ok((feed, first_sample))
+}
+
+#[cfg(not(feature = "static-sox"))]
 /// Build the stdin feeder for a true 12-bit FLAC source: streams the decoded
 /// samples (claxon), left-justified ×16 into 16-bit little-endian — byte-for-
 /// byte what SoX would have read from the equivalent 16-bit FLAC. Works for
@@ -913,7 +993,7 @@ fn chop_native_input_ex(
     // tag rewrite (the GUI's pre-conversion metadata rows).
     extra_comments: &[String],
 ) -> ChopResult {
-    let start = format!("{}s", start_samples);
+    let mut sox_start_samples = start_samples;
     let len = format!("{}s", length_samples);
     let sox_program = shelldet::resolve().unwrap_or_else(|| PathBuf::from("sox"));
     // 6-bit is emulated on a 6-bit grid in an 8-bit FLAC container via a
@@ -933,6 +1013,10 @@ fn chop_native_input_ex(
         Ok(f) => f,
         Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
     };
+    // Keep the pre-repair classification: long MISRC captures cannot be
+    // repaired in STREAMINFO when their real count exceeds 36 bits.
+    let scaled_rf_flac = in_fmt == InputFormat::Flac
+        && rf_flac_declared_length_is_unreliable(&probe::probe(Path::new(in_path)));
     let si_note = maybe_repair_streaminfo(in_fmt, in_path);
 
     // Pure-Rust path for plain trims of true 12-bit FLAC sources: with no
@@ -1104,6 +1188,29 @@ fn chop_native_input_ex(
         // A caller-provided stdin stream (the packed-.lds path): the input is
         // stdin ("-") with the caller's raw-s16 input args.
         Some((args, feed)) => (args, "-".to_string(), Some(feed)),
+        None if scaled_rf_flac && probe::probe(Path::new(in_path)).bits_per_sample == 16 => {
+            let p = probe::probe(Path::new(in_path));
+            match make_scaled_rf_flac_s16_feed(
+                in_path, start_samples, length_samples, p.channels,
+            ) {
+                Ok((feed, first_sample)) => {
+                    sox_start_samples = start_samples - first_sample;
+                    (
+                        vec![
+                            "-t".to_string(),
+                            "s16".to_string(),
+                            "-r".to_string(),
+                            p.header_sample_rate.to_string(),
+                            "-c".to_string(),
+                            p.channels.to_string(),
+                        ],
+                        "-".to_string(),
+                        Some(feed),
+                    )
+                }
+                Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+            }
+        }
         None => match twelve_bit_flac_source(in_fmt, in_path) {
             Some((rate, ch)) => match make_12bit_s16_feed(in_path) {
                 Ok(feed) => (
@@ -1182,7 +1289,7 @@ fn chop_native_input_ex(
         PathBuf::from(out_path)
     };
     cmd.arg(&out_target);
-    cmd.arg("trim").arg(&start).arg(&len);
+    cmd.arg("trim").arg(format!("{}s", sox_start_samples)).arg(&len);
 
     if let Some(rate) = opts.output_rate_hz {
         if rate > 0 && opts.basic_rf_filter {
@@ -1259,6 +1366,15 @@ fn chop_native_input_ex(
 
     if r.ok {
         if let Err(msg) = validate_cut_output(out_path, &r.stderr) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = msg;
+        }
+    }
+    if r.ok && scaled_rf_flac && opts.output_rate_hz.is_none() {
+        // A truncated or prematurely closed decoder can otherwise produce a
+        // nonempty but incomplete cut with a successful SoX exit status.
+        if let Err(msg) = validate_plain_trim_sample_count(out_path, length_samples) {
             r.ok = false;
             r.exit_code = -1;
             r.stderr = msg;
@@ -1598,6 +1714,21 @@ fn in_hints_for(
     Ok(hints)
 }
 
+// MISRC RF captures can declare a STREAMINFO sample count scaled by 1000,
+// even while their RF metadata contains the true count. This must not limit
+// SoX's input effect when a trusted RF length proves the header too short.
+fn rf_flac_declared_length_is_unreliable(info: &probe::ProbeResult) -> bool {
+    info.ok
+        && info.format == InputFormat::Flac
+        && info.is_rf
+        && info.total_samples_known
+        && info.declared_total_samples != 0
+        && info.total_samples > info.declared_total_samples
+        && (info.total_samples_from_vorbis
+            || info.total_samples_from_companion
+            || (info.total_samples_wraps > 0 && !info.total_samples_estimated))
+}
+
 #[cfg(feature = "static-sox")]
 /// Run one in-process libSoX effects chain: input → trim → [sinc] →
 /// [rate, if output rate differs] → [vol] → output. No dither is ever added.
@@ -1638,6 +1769,17 @@ unsafe fn run_chain(
         );
         if in_fmt.is_null() {
             return Err("sox_open_read failed".into());
+        }
+
+        // libSoX's input effect otherwise stops at the scaled STREAMINFO
+        // sample count. Leave the source FLAC untouched: a zero length means
+        // unknown and permits decoding until the real end of the stream.
+        // Only ignore a declared length when independent RF data proves it
+        // is too short; normal audio and correctly declared FLACs are unchanged.
+        if in_hints.is_none()
+            && rf_flac_declared_length_is_unreliable(&probe::probe(Path::new(in_path)))
+        {
+            (*in_fmt).signal.length = 0;
         }
 
         // Build the output signal/encoding from the input, applying the
@@ -1739,7 +1881,9 @@ unsafe fn run_chain(
             Some(e) => (false, e.clone()),
             None => {
                 let rc = sox_ffi::sox_flow_effects(chain, None, std::ptr::null_mut());
-                if rc == sox_ffi::SOX_SUCCESS {
+                // An intentional bounded trim may finish the chain at EOF.
+                // The post-cut check still rejects empty or short outputs.
+                if rc == sox_ffi::SOX_SUCCESS || rc == sox_ffi::SOX_EOF {
                     (true, String::new())
                 } else {
                     (false, format!("sox_flow_effects failed: {rc}"))
@@ -1895,6 +2039,13 @@ fn chop_native_input(
             r.stderr = msg;
         }
     }
+    if r.ok && opts.output_rate_hz.is_none() {
+        if let Err(msg) = validate_plain_trim_sample_count(out_path, length_samples) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = msg;
+        }
+    }
     if !si_note.is_empty() {
         r.stderr = if r.stderr.is_empty() {
             si_note
@@ -1909,6 +2060,25 @@ fn chop_native_input(
         rewrite_tags_after_cut(out_path, opts.is_rf, extra_comments, &mut r);
     }
     r
+}
+
+fn validate_plain_trim_sample_count(out_path: &str, expected: u64) -> Result<(), String> {
+    // Read the STREAMINFO field rather than the probe's reconstructed total:
+    // SoX may have copied stale source RF tags before the tag rewrite runs.
+    if expected >= (1u64 << 36) {
+        return Ok(());
+    }
+    let info = probe::probe(Path::new(out_path));
+    if !info.ok {
+        return Err(format!("could not inspect cut output sample count: {}", info.error));
+    }
+    if info.declared_total_samples != expected {
+        return Err(format!(
+            "cut sample count mismatch: expected {expected}, wrote {}",
+            info.declared_total_samples
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "static-sox")]
@@ -2716,6 +2886,145 @@ pub fn generate_output_path(in_path: &str, out_dir: &str, stem_override: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaled_rf_flac_header_does_not_truncate_later_window() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = std::env::temp_dir()
+            .join(format!("fc_rf_scaled_header_{}", temp_tag()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("input.s16");
+        let src = dir.join("source.flac");
+        let cut = dir.join("cut.flac");
+        // Multiple megabytes of incompressible samples force the fast locator
+        // to search the interior rather than always choosing the first frame.
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let samples: Vec<i16> = (0..1_600_000)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng as i16
+            })
+            .collect();
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        std::fs::write(&raw, bytes).unwrap();
+
+        // Generate a real 16-bit RF FLAC with correct RF tags.
+        let initial = chop_with_options(
+            raw.to_str().unwrap(),
+            src.to_str().unwrap(),
+            0,
+            samples.len() as u64,
+            ChopOptions {
+                is_rf: true,
+                input_format: Some(InputFormat::S16),
+                input_rate_hz: Some(40_000_000.0),
+                ..Default::default()
+            },
+        );
+        assert!(initial.ok, "{}", initial.stderr);
+        assert!(probe::probe(&src).total_samples_from_vorbis);
+
+        // Simulate a >36-bit RF capture using a compact fixture. Keep the
+        // actual encoded frames small, but make the trusted RF tag larger than
+        // STREAMINFO can store so the existing in-place header repair cannot
+        // make this test pass without the libSoX length fix.
+        let huge_total = (1u64 << 36) + samples.len() as u64;
+        crate::tags::replace_all_comments(
+            &src,
+            &[
+                ("RF_SAMPLE_RATE".into(), "40000000".into()),
+                ("RF_SAMPLE_RATE_KHZ".into(), "40000".into()),
+                ("RF_TOTAL_SAMPLES".into(), huge_total.to_string()),
+                (
+                    "DURATION_SECONDS".into(),
+                    format!("{:.6}", huge_total as f64 / 40_000_000.0),
+                ),
+            ],
+        )
+        .unwrap();
+
+        // Reproduce the MISRC header: declared count / 1000 while the
+        // Vorbis tag still carries the real sample count.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&src)
+            .unwrap();
+        f.seek(SeekFrom::Start(18)).unwrap();
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).unwrap();
+        let packed = u64::from_be_bytes(buf);
+        let mask = (1u64 << 36) - 1;
+        let new_packed = (packed & !mask) | (samples.len() as u64 / 1000);
+        f.seek(SeekFrom::Start(18)).unwrap();
+        f.write_all(&new_packed.to_be_bytes()).unwrap();
+        drop(f);
+        let input_info = probe::probe(&src);
+        assert!(rf_flac_declared_length_is_unreliable(&input_info));
+        assert_eq!(input_info.total_samples, huge_total);
+
+        // The window begins well after the misleading STREAMINFO end.
+        let start = 1_200_000u64;
+        let len = 18_000u64;
+        let frame = crate::fastseek::locate(&src, start).unwrap();
+        assert!(frame.first_sample > 0, "random-access seek returned the first frame");
+        assert!(frame.first_sample <= start);
+        let result = chop_with_options(
+            src.to_str().unwrap(),
+            cut.to_str().unwrap(),
+            start,
+            len,
+            ChopOptions { is_rf: true, ..Default::default() },
+        );
+        assert!(result.ok, "{}", result.stderr);
+        let mut decoder = claxon::FlacReader::open(&cut).unwrap();
+        let output: Vec<i16> = decoder.samples().map(|s| s.unwrap() as i16).collect();
+        assert_eq!(output, samples[start as usize..(start + len) as usize]);
+        let output_info = probe::probe(&cut);
+        assert_eq!(output_info.total_samples, len);
+        drop(decoder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rf_flac_invalid_header_length_requires_trusted_rf_total() {
+        let mut info = probe::ProbeResult {
+            ok: true,
+            format: InputFormat::Flac,
+            is_rf: true,
+            total_samples_known: true,
+            declared_total_samples: 97_395_933,
+            total_samples: 97_395_933_184,
+            total_samples_from_vorbis: true,
+            ..Default::default()
+        };
+        assert!(rf_flac_declared_length_is_unreliable(&info));
+
+        info.is_rf = false;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.is_rf = true;
+        info.format = InputFormat::Wav;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.format = InputFormat::Flac;
+        info.total_samples_from_vorbis = false;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_from_companion = true;
+        assert!(rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_from_companion = false;
+        info.total_samples_wraps = 1;
+        assert!(rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_estimated = true;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+        info.total_samples_from_vorbis = true;
+        info.declared_total_samples = info.total_samples;
+        assert!(!rf_flac_declared_length_is_unreliable(&info));
+    }
 
     #[test]
     fn parse_ldc_progress_extracts_last_percentage() {

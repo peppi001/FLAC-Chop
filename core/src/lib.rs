@@ -18,6 +18,7 @@ pub mod chop;
 pub mod companions;
 pub mod enc12;
 pub mod ffi;
+pub(crate) mod fastseek;
 pub mod lds;
 pub mod msps;
 pub mod ogg;

@@ -47,6 +47,9 @@ jobs:
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
+          # Avoid installer-release downloads failing with HTTP 504.
+          # Hosted Windows runners already carry an MSYS2 installation.
+          release: false
           msystem: CLANG64
           update: false
           install: mingw-w64-clang-x86_64-sox
