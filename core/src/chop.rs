@@ -1601,7 +1601,6 @@ fn in_hints_for(
 // MISRC RF captures can declare a STREAMINFO sample count scaled by 1000,
 // even while their RF metadata contains the true count. This must not limit
 // SoX's input effect when a trusted RF length proves the header too short.
-#[cfg(feature = "static-sox")]
 fn rf_flac_declared_length_is_unreliable(info: &probe::ProbeResult) -> bool {
     info.ok
         && info.format == InputFormat::Flac
@@ -2809,6 +2808,25 @@ mod tests {
         assert!(initial.ok, "{}", initial.stderr);
         assert!(probe::probe(&src).total_samples_from_vorbis);
 
+        // Simulate a >36-bit RF capture using a compact fixture. Keep the
+        // actual encoded frames small, but make the trusted RF tag larger than
+        // STREAMINFO can store so the existing in-place header repair cannot
+        // make this test pass without the libSoX length fix.
+        let huge_total = (1u64 << 36) + samples.len() as u64;
+        crate::tags::replace_all_comments(
+            &src,
+            &[
+                ("RF_SAMPLE_RATE".into(), "40000000".into()),
+                ("RF_SAMPLE_RATE_KHZ".into(), "40000".into()),
+                ("RF_TOTAL_SAMPLES".into(), huge_total.to_string()),
+                (
+                    "DURATION_SECONDS".into(),
+                    format!("{:.6}", huge_total as f64 / 40_000_000.0),
+                ),
+            ],
+        )
+        .unwrap();
+
         // Reproduce the MISRC header: declared count / 1000 while the
         // Vorbis tag still carries the real sample count.
         let mut f = std::fs::OpenOptions::new()
@@ -2827,7 +2845,7 @@ mod tests {
         drop(f);
         let input_info = probe::probe(&src);
         assert!(rf_flac_declared_length_is_unreliable(&input_info));
-        assert_eq!(input_info.total_samples, samples.len() as u64);
+        assert_eq!(input_info.total_samples, huge_total);
 
         // The window begins well after the misleading STREAMINFO end.
         let start = 120_000u64;
@@ -2845,6 +2863,7 @@ mod tests {
         assert_eq!(output, samples[start as usize..(start + len) as usize]);
         let output_info = probe::probe(&cut);
         assert_eq!(output_info.total_samples, len);
+        drop(decoder);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
