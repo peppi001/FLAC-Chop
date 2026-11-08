@@ -694,6 +694,60 @@ fn run_sox_child(
     Ok((status, stderr))
 }
 #[cfg(not(feature = "static-sox"))]
+/// Stream a 16-bit RF FLAC whose STREAMINFO length is known to be truncated.
+/// SoX/libFLAC refuses to read past the declared number of samples, even with
+/// --ignore-length. Claxon decodes FLAC frames to real signed s16 PCM and the
+/// existing SoX stdin path performs the sample-exact trim without rewriting
+/// the source or materializing the huge decoded capture on disk.
+fn make_scaled_rf_flac_s16_feed(
+    in_path: &str,
+    required_interleaved_samples: u64,
+) -> Result<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>, String> {
+    let path = in_path.to_owned();
+    Ok(Box::new(move |stdin: &mut std::process::ChildStdin| {
+        use std::io::Write;
+        let mut decoder = claxon::FlacReader::open(&path)
+            .map_err(|e| format!("RF FLAC decode open failed: {e}"))?;
+        if decoder.streaminfo().bits_per_sample != 16 {
+            return Err("RF FLAC stdin feeder requires a 16-bit source".into());
+        }
+        let mut input = decoder.samples();
+        let mut written = 0u64;
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        while written < required_interleaved_samples {
+            bytes.clear();
+            for _ in 0..32_768 {
+                if written >= required_interleaved_samples {
+                    break;
+                }
+                match input.next() {
+                    Some(Ok(value)) => {
+                        if value < i16::MIN as i32 || value > i16::MAX as i32 {
+                            return Err(format!("RF FLAC sample outside 16-bit range: {value}"));
+                        }
+                        bytes.extend_from_slice(&(value as i16).to_le_bytes());
+                        written += 1;
+                    }
+                    Some(Err(e)) => return Err(format!("RF FLAC decoding failed: {e}")),
+                    None => break,
+                }
+            }
+            if bytes.is_empty() {
+                break;
+            }
+            match stdin.write_all(&bytes) {
+                Ok(()) => {}
+                // Once the requested trim has finished, SoX closes stdin.
+                // This is expected and the output is checked after the cut.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(e) => return Err(format!("RF FLAC stdin write failed: {e}")),
+            }
+        }
+        Ok(())
+    }))
+}
+
+#[cfg(not(feature = "static-sox"))]
 /// Build the stdin feeder for a true 12-bit FLAC source: streams the decoded
 /// samples (claxon), left-justified ×16 into 16-bit little-endian — byte-for-
 /// byte what SoX would have read from the equivalent 16-bit FLAC. Works for
@@ -933,6 +987,10 @@ fn chop_native_input_ex(
         Ok(f) => f,
         Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
     };
+    // Keep the pre-repair classification: long MISRC captures cannot be
+    // repaired in STREAMINFO when their real count exceeds 36 bits.
+    let scaled_rf_flac = in_fmt == InputFormat::Flac
+        && rf_flac_declared_length_is_unreliable(&probe::probe(Path::new(in_path)));
     let si_note = maybe_repair_streaminfo(in_fmt, in_path);
 
     // Pure-Rust path for plain trims of true 12-bit FLAC sources: with no
@@ -1104,6 +1162,27 @@ fn chop_native_input_ex(
         // A caller-provided stdin stream (the packed-.lds path): the input is
         // stdin ("-") with the caller's raw-s16 input args.
         Some((args, feed)) => (args, "-".to_string(), Some(feed)),
+        None if scaled_rf_flac && probe::probe(Path::new(in_path)).bits_per_sample == 16 => {
+            let p = probe::probe(Path::new(in_path));
+            let interleaved = start_samples
+                .saturating_add(length_samples)
+                .saturating_mul(u64::from(p.channels));
+            match make_scaled_rf_flac_s16_feed(in_path, interleaved) {
+                Ok(feed) => (
+                    vec![
+                        "-t".to_string(),
+                        "s16".to_string(),
+                        "-r".to_string(),
+                        p.header_sample_rate.to_string(),
+                        "-c".to_string(),
+                        p.channels.to_string(),
+                    ],
+                    "-".to_string(),
+                    Some(feed),
+                ),
+                Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+            }
+        }
         None => match twelve_bit_flac_source(in_fmt, in_path) {
             Some((rate, ch)) => match make_12bit_s16_feed(in_path) {
                 Ok(feed) => (
@@ -2772,7 +2851,6 @@ pub fn generate_output_path(in_path: &str, out_dir: &str, stem_override: &str) -
 mod tests {
     use super::*;
 
-    #[cfg(feature = "static-sox")]
     #[test]
     fn scaled_rf_flac_header_does_not_truncate_later_window() {
         use std::io::{Read, Seek, SeekFrom, Write};
