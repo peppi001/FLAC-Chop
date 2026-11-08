@@ -43,6 +43,7 @@ set(RUST_SOURCES
     "${CORE_DIR}/src/companions.rs"
     "${CORE_DIR}/src/enc12.rs"
     "${CORE_DIR}/src/ffi.rs"
+    "${CORE_DIR}/src/fastseek.rs"
     "${CORE_DIR}/src/lds.rs"
     "${CORE_DIR}/src/msps.rs"
     "${CORE_DIR}/src/ogg.rs"
