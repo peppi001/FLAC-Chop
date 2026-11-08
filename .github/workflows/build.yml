@@ -270,6 +270,9 @@ jobs:
       - name: Setup MSYS2 (CLANG64)
         uses: msys2/setup-msys2@v2
         with:
+          # Avoid installer-release downloads failing with HTTP 504.
+          # Hosted Windows runners already carry an MSYS2 installation.
+          release: false
           # MINGW64 is deprecated upstream (2026-03-15 news) and its packages
           # are being removed: mingw-w64-x86_64-sox vanished from the repo DB
           # between the green 2026-10-11 run and 2026-10-17 ("target not
@@ -570,6 +573,9 @@ jobs:
       - name: Setup MSYS2 (CLANGARM64)
         uses: msys2/setup-msys2@v2
         with:
+          # Avoid installer-release downloads failing with HTTP 504.
+          # Hosted Windows runners already carry an MSYS2 installation.
+          release: false
           msystem: CLANGARM64
           update: true
           install: >-
